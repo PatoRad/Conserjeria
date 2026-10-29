@@ -52,6 +52,18 @@ Helpers: `es_staff()` (conserje o admin), `es_admin()`.
 | `a0_proteger_update` (BEFORE UPDATE) | visitas, encomiendas, bitacora | `proteger_update()` | Un conserje solo puede registrar salida/retirada (una vez, con hora del servidor) o anular con motivo. Un registro anulado queda bloqueado. El admin y las sesiones sin usuario (SQL Editor) no tienen restricción. |
 | `a1`, `a2`, `a3` | visitas, encomiendas, bitacora | `auditar()` | Guarda cada cambio como JSON en `auditoria`. |
 
+## Registro de quién anula
+
+`visitas`, `encomiendas` y `bitacora` tienen dos columnas más: `anulado_por uuid` (conserje del turno activo al anular; nulo si anuló la administración sin turno) y `anulada_en timestamptz`. Las asigna el servidor en `proteger_update()` cuando `anulada` pasa de falso a verdadero, y `forzar_insert()` las deja nulas al insertar. Las anulaciones anteriores a este cambio no tienen autor. La pestaña Admin las muestra leyendo `auditoria`.
+
+```sql
+alter table public.visitas     add column if not exists anulado_por uuid references public.conserjes(id) on delete set null, add column if not exists anulada_en timestamptz;
+alter table public.encomiendas add column if not exists anulado_por uuid references public.conserjes(id) on delete set null, add column if not exists anulada_en timestamptz;
+alter table public.bitacora    add column if not exists anulado_por uuid references public.conserjes(id) on delete set null, add column if not exists anulada_en timestamptz;
+```
+
+Las versiones vigentes de `forzar_insert()` y `proteger_update()` son las del script de "Registro de quién anula (SQL)" al final de este archivo; reemplazan a las del bloque de endurecimiento.
+
 ## Funciones
 
 Las funciones de `security definer` fijan `search_path`. `iniciar_turno` usa `crypt()` de la extensión `pgcrypto` (esquema `extensions`).
@@ -329,6 +341,89 @@ select cron.schedule('purga-conserjeria', '0 7 * * *',
 ```
 
 Para revisar las corridas: `select status, return_message, start_time from cron.job_run_details order by start_time desc limit 3;`
+
+## Registro de quién anula (SQL)
+
+```sql
+create or replace function public.forzar_insert()
+ returns trigger language plpgsql security definer set search_path to 'public'
+as $$
+begin
+  if auth.uid() is null then return new; end if;
+
+  new.conserje_id := public.conserje_de_turno();
+  if new.conserje_id is null then
+    raise exception 'No hay un turno activo. Inicia turno para registrar';
+  end if;
+  new.anulada := false;
+  new.motivo_anulacion := null;
+  new.anulado_por := null;
+  new.anulada_en := null;
+
+  new := jsonb_populate_record(new, jsonb_build_object(
+    case tg_table_name when 'visitas' then 'entrada'
+                       when 'encomiendas' then 'recibida'
+                       else 'creado' end, now()));
+  if tg_table_name = 'visitas' then
+    new := jsonb_populate_record(new, jsonb_build_object('salida', null));
+  elsif tg_table_name = 'encomiendas' then
+    new := jsonb_populate_record(new, jsonb_build_object('retirada', null));
+  end if;
+  return new;
+end $$;
+
+create or replace function public.proteger_update()
+ returns trigger language plpgsql security definer set search_path to 'public'
+as $$
+declare
+  v_old jsonb := to_jsonb(old);
+  v_new jsonb := to_jsonb(new);
+  permitidas text[];
+  k text;
+begin
+  -- Sello de anulación (también cuando anula el admin)
+  if new.anulada and not old.anulada then
+    new.anulado_por := public.conserje_de_turno();
+    new.anulada_en := now();
+  elsif not new.anulada then
+    new.anulado_por := null;
+    new.anulada_en := null;
+  end if;
+
+  if auth.uid() is null or public.es_admin() then return new; end if;
+
+  permitidas := case tg_table_name
+    when 'visitas'     then array['salida','anulada','motivo_anulacion']
+    when 'encomiendas' then array['retirada','anulada','motivo_anulacion']
+    else array['anulada','motivo_anulacion'] end;
+
+  if (v_new - permitidas) is distinct from (v_old - permitidas) then
+    raise exception 'Solo se puede registrar salida/retirada o anular';
+  end if;
+
+  if old.anulada then
+    raise exception 'Registro anulado: solo administración puede modificarlo';
+  end if;
+  if new.anulada and coalesce(btrim(new.motivo_anulacion),'') = '' then
+    raise exception 'Falta el motivo de la anulación';
+  end if;
+  if not new.anulada and new.motivo_anulacion is distinct from old.motivo_anulacion then
+    raise exception 'No se puede cambiar el motivo sin anular';
+  end if;
+
+  foreach k in array array['salida','retirada'] loop
+    if v_old ? k then
+      if v_old->>k is not null and v_new->k is distinct from v_old->k then
+        raise exception 'Ese registro ya tiene % registrada', k;
+      elsif v_old->>k is null and v_new->>k is not null then
+        new := jsonb_populate_record(new, jsonb_build_object(k, now()));
+      end if;
+    end if;
+  end loop;
+
+  return new;
+end $$;
+```
 
 ## Pendiente de documentar
 
